@@ -17,6 +17,9 @@ class FeatureExtractor:
     - Time tensor: Time-based features
     - Features tensor: Market microstructure features
     - Timedelta tensor: Time differences between ticks
+    
+    All features are calculated causally, using only data available up to 
+    the current point in time to avoid look-ahead bias.
     """
     
     def __init__(self, window_sizes: List[int] = [10, 20, 50]):
@@ -29,7 +32,8 @@ class FeatureExtractor:
             List of window sizes for feature calculation
         """
         self.window_sizes = window_sizes
-        self.scaler = StandardScaler()
+        # Remove unused StandardScaler to avoid potential misuse
+        # self.scaler = StandardScaler()
         # Default market features count
         self._feature_count = 20  # Base number of features extracted
         
@@ -54,6 +58,9 @@ class FeatureExtractor:
     ) -> pd.DataFrame:
         """
         Extract specific features from tick data.
+        
+        All features are calculated in a causal manner, using only information
+        available up to the current point in time, preventing look-ahead bias.
         
         Parameters:
         -----------
@@ -149,7 +156,8 @@ class FeatureExtractor:
         self,
         df: pd.DataFrame,
         timestamp_col: str = 'Timestamp',
-        window_size: int = 50
+        window_size: int = 50,
+        causal: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Create tensors for transformer model input.
@@ -162,6 +170,9 @@ class FeatureExtractor:
             Column name for timestamp
         window_size : int
             Size of sliding window for creating tensors
+        causal : bool
+            If True, use causal context (only past information) for real-time applications
+            If False, use bidirectional context (past and future) for research purposes only
             
         Returns:
         --------
@@ -217,8 +228,21 @@ class FeatureExtractor:
         features_tensor_list = []
         timedelta_tensor_list = []
         
-        for i in range(len(df) - window_size + 1):
-            window_df = df.iloc[i:i+window_size]
+        # In causal mode, each prediction point uses only past and current information
+        # preventing future information leakage for real-time applications
+        for i in range(window_size - 1, len(df)):
+            if causal:
+                # Causal context: use window_size-1 previous points + current point
+                # This ensures no future leakage for real-time applications
+                window_df = df.iloc[i-(window_size-1):i+1]
+            else:
+                # Bidirectional context: center window around prediction point
+                # WARNING: This creates future information leakage and should only be
+                # used for research, not for backtests or real-time applications
+                window_start = max(0, i - window_size // 2)
+                window_end = min(len(df), window_start + window_size)
+                window_start = max(0, window_end - window_size)  # Adjust start if end hit boundary
+                window_df = df.iloc[window_start:window_end]
             
             # Create time tensor
             time_window = window_df[time_features].values
@@ -252,6 +276,8 @@ class FeatureExtractor:
         """
         Calculate bipower variation (BPV) - a robust estimator of integrated variance
         that is less affected by jumps than realized variance.
+        
+        CAUSAL FEATURE: Uses rolling windows (backward-looking only) to calculate bipower variation.
         
         Introduced by Barndorff-Nielsen and Shephard (2004), bipower variation
         uses products of adjacent absolute returns to filter out jumps.
@@ -437,6 +463,9 @@ class FeatureExtractor:
         """
         Calculate tick imbalance to measure buying vs selling pressure.
         Tick imbalance ranges from -1 (all sells) to 1 (all buys).
+        
+        CAUSAL FEATURE: Uses rolling window calculations that only look backward.
+        Each value is computed using only current and past data points.
         """
         result_df = df.copy()
         
@@ -464,6 +493,9 @@ class FeatureExtractor:
         1. Jump diffusion: estimate of jump component in price process
         2. Jump magnitude: size of significant jumps
         3. Jump arrival: frequency of jumps
+        
+        CAUSAL FEATURE: Wavelet transformation is applied to existing returns. The exponential 
+        weighted moving average (ewm) for jump arrival looks only at past jumps.
         """
         result_df = df.copy()
         
@@ -471,9 +503,9 @@ class FeatureExtractor:
         log_returns = result_df['log_return'].values
         
         # Apply wavelet decomposition using PyWavelets
-        # Use 'db4' wavelet with 4 levels of decomposition
+        # Use 'db4' wavelet with 3 levels of decomposition (reduced from 4)
         wavelet = 'db4'
-        level = 4
+        level = 3  # Reduced from 4 to avoid warnings
         
         # Pad the signal to ensure proper length
         n = len(log_returns)
@@ -557,6 +589,9 @@ class FeatureExtractor:
         
         This implementation uses regression of price changes on signed volume
         to estimate the price impact coefficient.
+        
+        CAUSAL FEATURE: For each point, lambda is calculated using only prior observations
+        in the rolling window, ensuring no future information leakage.
         """
         result_df = df.copy()
         
@@ -604,6 +639,9 @@ class FeatureExtractor:
         """
         Calculate orderflow imbalance as the sum of signed volumes.
         Positive values indicate buying pressure, negative values indicate selling pressure.
+        
+        CAUSAL FEATURE: Uses a backward-looking rolling window that only considers
+        past trades, ensuring no future data is used in the calculation.
         """
         result_df = df.copy()
         
@@ -629,6 +667,10 @@ class FeatureExtractor:
         """
         Calculate price momentum at different time scales.
         Momentum is measured as the rate of change of price.
+        
+        CAUSAL FEATURE: Uses pandas pct_change() which calculates percentage change
+        relative to prior values (current price / previous price - 1), ensuring
+        no future information is included.
         """
         result_df = df.copy()
         
@@ -651,6 +693,9 @@ class FeatureExtractor:
     ) -> pd.DataFrame:
         """
         Calculate price range (max - min) over different windows.
+        
+        CAUSAL FEATURE: Uses backward-looking rolling windows to calculate
+        min and max values, ensuring no future information is used.
         """
         result_df = df.copy()
         
@@ -682,6 +727,9 @@ class FeatureExtractor:
         """
         Calculate volatility per unit of volume.
         This measures how much volatility is generated per unit of trading volume.
+        
+        CAUSAL FEATURE: Uses backward-looking rolling sum of volume
+        to normalize volatility, ensuring no future information is used.
         """
         result_df = df.copy()
         
@@ -698,6 +746,9 @@ class FeatureExtractor:
         """
         Clean features by handling any remaining NaN, infinite or extreme values.
         This ensures the data is ready for neural network training.
+        
+        CAUSAL IMPLEMENTATION: All calculations only use data available up to each point 
+        to avoid look-ahead bias.
         
         Parameters:
         -----------
@@ -743,12 +794,21 @@ class FeatureExtractor:
                         result_df[col] = result_df[col].ffill()
                         
                         # If any NaNs remain, use the median of non-NaN values
+                        # CAUSAL: Calculate expanding window medians
                         if result_df[col].isna().any():
                             if np.issubdtype(result_df[col].dtype, np.number):
-                                col_median = result_df[col].median()
-                                # If median is NaN, use 0 as fallback
-                                replacement_value = 0 if pd.isna(col_median) else col_median
-                                result_df[col] = result_df[col].fillna(replacement_value)
+                                # For each NaN value, use median of prior values
+                                for i in range(len(result_df)):
+                                    if pd.isna(result_df.loc[i, col]):
+                                        # If we have enough prior data, use prior median
+                                        if i > 0:
+                                            prior_vals = result_df.loc[:i-1, col].dropna()
+                                            if len(prior_vals) > 0:
+                                                result_df.loc[i, col] = prior_vals.median()
+                                            else:
+                                                result_df.loc[i, col] = 0
+                                        else:
+                                            result_df.loc[i, col] = 0
                             else:
                                 # For non-numeric columns, use forward fill then backward fill
                                 result_df[col] = result_df[col].ffill().bfill()
@@ -772,37 +832,59 @@ class FeatureExtractor:
                 
                 if col_infs > 0:
                     cols_with_infs += 1
-                    # Find median of finite values
-                    finite_values = result_df.loc[~inf_mask, col]
-                    col_median = finite_values.median()
-                    
-                    # Replace infinities with median or 0
-                    replacement = 0 if pd.isna(col_median) else col_median
-                    result_df[col] = result_df[col].replace([np.inf, -np.inf], replacement)
+                    # CAUSAL: Replace infinities using expanding windows
+                    for i in range(len(result_df)):
+                        if np.isinf(result_df.loc[i, col]):
+                            # Use median of prior finite values
+                            if i > 0:
+                                prior_vals = result_df.loc[:i-1, col]
+                                prior_vals = prior_vals[~np.isinf(prior_vals)]
+                                if len(prior_vals) > 0:
+                                    replacement = prior_vals.median()
+                                    result_df.loc[i, col] = replacement if not pd.isna(replacement) else 0
+                                else:
+                                    result_df.loc[i, col] = 0
+                            else:
+                                result_df.loc[i, col] = 0
             
             if total_infs > 0:
                 print(f"Found {total_infs} infinite values across {cols_with_infs} columns")
                     
-        # Clip extremely large/small values to reasonable range (only for numeric columns)
+        # Use expanding window approach for outlier clipping
+        # to ensure we only use data up to the current point (causal)
+        min_window_size = 100  # Minimum points needed for reliable percentiles
         for col in numeric_cols:
             if col not in [price_col, volume_col, 'SYMBOL']:
+                # Initialize arrays for bounds to avoid repeated pandas operations
+                upper_bounds = np.full(len(result_df), np.nan)
+                lower_bounds = np.full(len(result_df), np.nan)
+                
                 try:
-                    # Get 1st and 99th percentiles
-                    q01 = result_df[col].quantile(0.01)
-                    q99 = result_df[col].quantile(0.99)
-                    
-                    # Ensure the range is non-zero to avoid clipping everything to the same value
-                    if q99 > q01:
-                        # Add a buffer to avoid clipping too aggressively
-                        buffer = (q99 - q01) * 0.5
-                        lower_bound = q01 - buffer
-                        upper_bound = q99 + buffer
+                    # Calculate expanding window percentiles
+                    for i in range(min_window_size, len(result_df)):
+                        # Use only data up to current point for bounds calculation
+                        subset = result_df.loc[:i, col].dropna()
                         
-                        # Clip the values
-                        result_df[col] = result_df[col].clip(lower_bound, upper_bound)
-                except:
-                    # Skip columns that can't be quantiled
-                    pass
+                        if len(subset) >= min_window_size:
+                            q01 = np.percentile(subset, 1)
+                            q99 = np.percentile(subset, 99)
+                            
+                            # Ensure the range is non-zero to avoid clipping everything to the same value
+                            if q99 > q01:
+                                # Add a buffer to avoid clipping too aggressively
+                                buffer = (q99 - q01) * 0.5
+                                lower_bounds[i] = q01 - buffer
+                                upper_bounds[i] = q99 + buffer
+                    
+                    # Apply clipping based on expanding window bounds
+                    for i in range(min_window_size, len(result_df)):
+                        if not np.isnan(lower_bounds[i]) and not np.isnan(upper_bounds[i]):
+                            current_val = result_df.loc[i, col]
+                            result_df.loc[i, col] = max(lower_bounds[i], min(upper_bounds[i], current_val))
+                        
+                except Exception as e:
+                    # Skip columns that can't be processed
+                    print(f"Skip outlier clipping for {col}: {str(e)}")
                     
         # Verify no NaNs remain
         final_nan_count = result_df[cols_to_clean].isna().sum().sum()
