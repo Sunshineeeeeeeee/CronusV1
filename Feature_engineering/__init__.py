@@ -10,6 +10,10 @@ from .feature_model_v1 import (
     save_model,
     load_model
 )
+from .feature_selection import (
+    FeatureSelector,
+    run_feature_selection
+)
 
 
 __all__ = [
@@ -23,5 +27,7 @@ __all__ = [
     'load_model',
     'FeatureAnalyzer',
     'analyze_attention_patterns',
-    'analyze_feature_groups'
+    'analyze_feature_groups',
+    'FeatureSelector',
+    'run_feature_selection'
 ] 
