@@ -7,22 +7,13 @@ in high-frequency trading data.
 
 Key features:
 - Optimized distance metrics for financial time series (distribution-based, wavelet-based)
-- Highly efficient distance matrix computation with parallelization
-- Scalable to extremely large datasets (millions of points) using sparse approximation
+- Efficient distance matrix computation with parallelization
 - Support for distributed computing with Dask
-- GPU acceleration with FAISS (if available)
-
-Sparse approximation is automatically used for datasets larger than 20,000 points,
-which dramatically reduces computation time with minimal impact on accuracy.
-This approach computes only the k-nearest neighbors for each point instead of
-the full distance matrix, resulting in O(n log n) complexity instead of O(n²).
 
 Dependencies:
 - Required: numpy, scipy, pandas
 - Optional: joblib (for parallel processing)
 - Optional: dask (for distributed computing)
-- Optional: faiss-gpu/faiss-cpu (for GPU-accelerated sparse approximation)
-- Optional: scikit-learn (fallback for sparse approximation)
 - Optional: pywt (for wavelet-based distances)
 - Optional: ot (for optimized Wasserstein distance)
 
@@ -35,15 +26,6 @@ distance_func = create_financial_distance_function(metric='distribution')
 
 # Compute distance matrix
 distance_matrix = compute_distance_matrix(windows, distance_func)
-
-# For large datasets, enable sparse approximation
-distance_matrix = compute_distance_matrix(
-    windows, 
-    distance_func,
-    use_sparse_approx=True,
-    sparse_neighbors=100,
-    use_gpu=True
-)
 ```
 """
 
@@ -85,22 +67,6 @@ try:
 except ImportError:
     DASK_AVAILABLE = False
     logger.warning("Dask not installed. Falling back to joblib for parallelization.")
-
-# Try to import FAISS for approximate nearest neighbor search
-try:
-    import faiss
-    FAISS_AVAILABLE = True
-except ImportError:
-    FAISS_AVAILABLE = False
-    logger.warning("FAISS not installed. Sparse approximation for large datasets will not be available. Install with: pip install faiss-gpu or pip install faiss-cpu")
-
-# Try to import sklearn for alternative nearest neighbor implementation
-try:
-    from sklearn.neighbors import NearestNeighbors
-    SKLEARN_NN_AVAILABLE = True
-except ImportError:
-    SKLEARN_NN_AVAILABLE = False
-    logger.warning("Scikit-learn not installed. Some fallback methods may not be available.")
 
 class FinancialDistanceMetrics:
     """Distance metrics for financial time series in HFT."""
@@ -303,297 +269,22 @@ def create_financial_distance_function(metric: str = 'distribution',
         return partial(FinancialDistanceMetrics.distribution_distance, method=distribution_method)
 
 
-def _flatten_and_normalize_windows(windows: List[np.ndarray]) -> np.ndarray:
-    """
-    Flatten and normalize time series windows for use with FAISS.
-    
-    Args:
-        windows: List of time series windows
-        
-    Returns:
-        Normalized feature matrix of shape (n_windows, n_features)
-    """
-    # First determine the largest dimension needed
-    max_dim = max(w.size for w in windows)
-    
-    # Prepare feature matrix
-    n_windows = len(windows)
-    features = np.zeros((n_windows, max_dim), dtype=np.float32)
-    
-    # Fill feature matrix and pad shorter sequences
-    for i, window in enumerate(windows):
-        flat_window = window.flatten()
-        features[i, :len(flat_window)] = flat_window
-        
-        # Add mask for padded regions (set to mean of non-padded)
-        if len(flat_window) < max_dim:
-            features[i, len(flat_window):] = np.mean(flat_window)
-    
-    # Normalize features using robust scaling (similar to distribution_distance)
-    for i in range(n_windows):
-        row = features[i]
-        q75, q25 = np.percentile(row, [75, 25])
-        iqr = q75 - q25
-        median = np.median(row)
-        
-        # Avoid division by zero
-        iqr = iqr if iqr > 0 else 1.0
-        
-        # Scale using IQR
-        features[i] = (row - median) / iqr
-    
-    # Replace NaN values
-    features = np.nan_to_num(features)
-    
-    # Normalize each vector to unit length for cosine similarity
-    norms = np.linalg.norm(features, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0  # Avoid division by zero
-    features = features / norms
-    
-    return features
-
-
-def _compute_with_faiss(windows: List[np.ndarray], 
-                        distance_func: Callable, 
-                        n_neighbors: int = 50,
-                        use_gpu: bool = False) -> Tuple[np.ndarray, float]:
-    """
-    Compute approximate distance matrix using FAISS HNSW index.
-    This method scales to millions of points and only computes the k-nearest
-    neighbors for each point, resulting in a sparse distance matrix.
-    
-    Args:
-        windows: List of time series windows
-        distance_func: Function to compute distance between two windows
-        n_neighbors: Number of nearest neighbors to compute for each point
-        use_gpu: Whether to use GPU acceleration if available
-        
-    Returns:
-        Tuple of (sparse_distance_matrix, sparsity_level)
-    """
-    if not FAISS_AVAILABLE:
-        logger.warning("FAISS not available. Using dense distance matrix computation.")
-        return None, 0.0
-    
-    n_windows = len(windows)
-    logger.info(f"Computing approximate distance matrix with FAISS for {n_windows} windows")
-    
-    # Convert windows to feature vectors
-    features = _flatten_and_normalize_windows(windows)
-    d = features.shape[1]  # Dimensionality
-    
-    try:
-        # Configure FAISS index
-        # HNSW index parameters: 
-        # M = number of connections per layer (higher = more accurate but slower)
-        # efConstruction = construction time/accuracy trade-off
-        # efSearch = query time/accuracy trade-off
-        M = 32
-        efConstruction = 100
-        efSearch = 128
-        
-        if use_gpu and hasattr(faiss, 'StandardGpuResources'):
-            # Use GPU if available and requested
-            logger.info("Using GPU-accelerated FAISS index")
-            res = faiss.StandardGpuResources()
-            config = faiss.GpuIndexFlatConfig()
-            config.device = 0  # GPU device ID
-            
-            # Create CPU index then transfer to GPU
-            cpu_index = faiss.IndexHNSWFlat(d, M, faiss.METRIC_INNER_PRODUCT)
-            index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-        else:
-            # Use CPU index
-            logger.info("Using CPU-based FAISS index")
-            index = faiss.IndexHNSWFlat(d, M, faiss.METRIC_INNER_PRODUCT)
-        
-        # Set HNSW parameters
-        index.hnsw.efConstruction = efConstruction
-        index.hnsw.efSearch = efSearch
-        
-        # Train and add vectors
-        index.train(features)
-        index.add(features)
-        
-        # Set search parameters
-        index.hnsw.efSearch = efSearch
-        
-        # Perform search for all points
-        logger.info(f"Searching for {n_neighbors} nearest neighbors for each point")
-        similarities, indices = index.search(features, n_neighbors)
-        
-        # Convert similarities to distances (1 - cosine_similarity for normalized vectors)
-        # This is an approximation of the euclidean distance between normalized vectors
-        distances = 1 - similarities
-        
-        # Create sparse distance matrix
-        dist_matrix = np.zeros((n_windows, n_windows))
-        
-        # Fill in the k-nearest neighbors for each point
-        for i in range(n_windows):
-            for j, idx in enumerate(indices[i]):
-                if idx >= 0 and idx < n_windows:  # Valid index
-                    dist_val = distances[i, j]
-                    # Ensure distances are non-negative
-                    dist_val = max(0.0, dist_val)
-                    
-                    # Set distance in matrix (ensure symmetry)
-                    dist_matrix[i, idx] = dist_val
-                    dist_matrix[idx, i] = dist_val
-        
-        # Calculate sparsity level
-        nonzero = np.count_nonzero(dist_matrix)
-        total_elements = n_windows * n_windows
-        sparsity = nonzero / total_elements
-        
-        logger.info(f"Computed sparse distance matrix with {nonzero} non-zero elements ({sparsity:.2%} density)")
-        
-        # Refine distances for k-nearest neighbors using the actual distance function
-        if distance_func is not None:
-            logger.info("Refining distances for nearest neighbors using exact distance function")
-            
-            # Get non-zero indices
-            rows, cols = np.nonzero(dist_matrix)
-            
-            # Process in batches to avoid memory issues
-            batch_size = 10000
-            for start in range(0, len(rows), batch_size):
-                end = min(start + batch_size, len(rows))
-                batch_rows = rows[start:end]
-                batch_cols = cols[start:end]
-                
-                # Compute exact distances for this batch
-                for idx in range(len(batch_rows)):
-                    i, j = batch_rows[idx], batch_cols[idx]
-                    if i < j:  # Only compute upper triangle to avoid double computation
-                        exact_dist = distance_func(windows[i], windows[j])
-                        dist_matrix[i, j] = exact_dist
-                        dist_matrix[j, i] = exact_dist  # Ensure symmetry
-        
-        return dist_matrix, sparsity
-        
-    except Exception as e:
-        logger.error(f"Error in FAISS computation: {str(e)}")
-        logger.warning("Falling back to dense distance matrix computation")
-        return None, 0.0
-
-
-def _compute_with_sklearn_ann(windows: List[np.ndarray], 
-                             distance_func: Callable,
-                             n_neighbors: int = 50) -> Tuple[np.ndarray, float]:
-    """
-    Fallback method using scikit-learn's NearestNeighbors for approximate distance matrix computation.
-    
-    Args:
-        windows: List of time series windows
-        distance_func: Function to compute distance between two windows
-        n_neighbors: Number of nearest neighbors to compute for each point
-        
-    Returns:
-        Tuple of (sparse_distance_matrix, sparsity_level)
-    """
-    if not SKLEARN_NN_AVAILABLE:
-        logger.warning("Scikit-learn not available. Using dense distance matrix computation.")
-        return None, 0.0
-    
-    n_windows = len(windows)
-    logger.info(f"Computing approximate distance matrix with scikit-learn for {n_windows} windows")
-    
-    # Convert windows to feature vectors
-    features = _flatten_and_normalize_windows(windows)
-    
-    try:
-        # Create NearestNeighbors model
-        nn = NearestNeighbors(n_neighbors=min(n_neighbors, n_windows), 
-                              algorithm='ball_tree', 
-                              metric='cosine', 
-                              n_jobs=-1)
-        
-        # Fit model
-        nn.fit(features)
-        
-        # Find k-nearest neighbors
-        distances, indices = nn.kneighbors(features)
-        
-        # Convert cosine distances to similarities
-        distances = 1 - distances  # cosine similarity
-        
-        # Create sparse distance matrix
-        dist_matrix = np.zeros((n_windows, n_windows))
-        
-        # Fill in the k-nearest neighbors for each point
-        for i in range(n_windows):
-            for j, idx in enumerate(indices[i]):
-                if idx >= 0 and idx < n_windows:  # Valid index
-                    dist_val = distances[i, j]
-                    
-                    # Set distance in matrix (ensure symmetry)
-                    dist_matrix[i, idx] = dist_val
-                    dist_matrix[idx, i] = dist_val
-        
-        # Calculate sparsity level
-        nonzero = np.count_nonzero(dist_matrix)
-        total_elements = n_windows * n_windows
-        sparsity = nonzero / total_elements
-        
-        logger.info(f"Computed sparse distance matrix with {nonzero} non-zero elements ({sparsity:.2%} density)")
-        
-        # Refine distances for k-nearest neighbors using the actual distance function
-        if distance_func is not None:
-            logger.info("Refining distances for nearest neighbors using exact distance function")
-            
-            # Get non-zero indices
-            rows, cols = np.nonzero(dist_matrix)
-            
-            # Process in batches to avoid memory issues
-            batch_size = 10000
-            for start in range(0, len(rows), batch_size):
-                end = min(start + batch_size, len(rows))
-                batch_rows = rows[start:end]
-                batch_cols = cols[start:end]
-                
-                # Compute exact distances for this batch
-                for idx in range(len(batch_rows)):
-                    i, j = batch_rows[idx], batch_cols[idx]
-                    if i < j:  # Only compute upper triangle to avoid double computation
-                        exact_dist = distance_func(windows[i], windows[j])
-                        dist_matrix[i, j] = exact_dist
-                        dist_matrix[j, i] = exact_dist  # Ensure symmetry
-        
-        return dist_matrix, sparsity
-        
-    except Exception as e:
-        logger.error(f"Error in scikit-learn ANN computation: {str(e)}")
-        logger.warning("Falling back to dense distance matrix computation")
-        return None, 0.0
-
-
 def compute_distance_matrix(windows: List[np.ndarray], 
                           distance_func: Callable,
                           running_locally: bool = True,
                           n_jobs: int = -1,  # Default to using all cores
-                          block_size: int = None,  # Will be calculated adaptively
-                          start_dask_client: bool = False,
-                          use_sparse_approx: bool = True,  # Whether to use sparse approximation for large datasets
-                          sparse_neighbors: int = 100,  # Number of neighbors for sparse approximation
-                          use_gpu: bool = False  # Whether to use GPU for FAISS if available
+                          block_size: int = None  # Will be calculated adaptively
                           ) -> np.ndarray:
     """
     Compute pairwise distance matrix for a list of time series windows.
     Optimized for HFT data with distributed processing support using block-wise computation.
-    For very large datasets (>20k points), uses sparse approximation via FAISS or scikit-learn.
     
     Args:
         windows: List of time series windows
         distance_func: Function to compute distance between two windows
         running_locally: If True, always use joblib with maximum cores, if False use Dask
-        use_parallel: Whether to use parallel processing
         n_jobs: Number of jobs for parallel processing (-1 for all cores)
         block_size: Size of blocks for block-wise computation (None for adaptive)
-        start_dask_client: Whether to start a new Dask client (only used if running_locally=False)
-        use_sparse_approx: Whether to use sparse approximation for large datasets (>20k points)
-        sparse_neighbors: Number of neighbors to compute for each point in sparse approximation
-        use_gpu: Whether to use GPU for FAISS if available
         
     Returns:
         Distance matrix of shape (n_windows, n_windows)
@@ -617,37 +308,6 @@ def compute_distance_matrix(windows: List[np.ndarray],
                     dist_matrix[j, i] = dist  # Symmetric
         return dist_matrix
     
-    # For very large datasets, use sparse approximation if enabled
-    if n_windows > 20000 and use_sparse_approx:
-        logger.info(f"Large dataset detected ({n_windows} windows). Using sparse approximation.")
-        
-        # Try FAISS first (faster and more accurate)
-        if FAISS_AVAILABLE:
-            dist_matrix, sparsity = _compute_with_faiss(
-                windows, 
-                distance_func, 
-                n_neighbors=sparse_neighbors,
-                use_gpu=use_gpu
-            )
-            
-            if dist_matrix is not None:
-                logger.info(f"Successfully computed sparse distance matrix with FAISS (density: {sparsity:.2%})")
-                return dist_matrix
-        
-        # Fall back to scikit-learn if FAISS not available
-        if SKLEARN_NN_AVAILABLE:
-            dist_matrix, sparsity = _compute_with_sklearn_ann(
-                windows, 
-                distance_func, 
-                n_neighbors=sparse_neighbors
-            )
-            
-            if dist_matrix is not None:
-                logger.info(f"Successfully computed sparse distance matrix with scikit-learn (density: {sparsity:.2%})")
-                return dist_matrix
-        
-        logger.warning("Sparse approximation failed or not available. Falling back to dense computation.")
-    
     # Calculate optimal chunk size for either implementation
     if n_jobs <= 0:
         n_jobs = max(os.cpu_count() - 1, 1)
@@ -658,7 +318,7 @@ def compute_distance_matrix(windows: List[np.ndarray],
         return _compute_with_joblib(windows, distance_func, n_jobs, n_windows, block_size)
     else:
         # Use Dask for distributed computing
-        return _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size, start_dask_client)
+        return _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size)
 
 def _compute_with_joblib(windows, distance_func, n_jobs, n_windows, block_size=None):
     """
@@ -688,6 +348,8 @@ def _compute_with_joblib(windows, distance_func, n_jobs, n_windows, block_size=N
                 
             # Calculate chunk size to achieve the target chunks per worker
             chunk_size = max(10, n_windows // (n_jobs * chunks_per_worker))
+        else:
+            chunk_size = block_size
         
         logger.info(f"Computing with joblib using {n_jobs} workers, chunk size: {chunk_size}")
         
@@ -764,7 +426,7 @@ def _compute_with_joblib(windows, distance_func, n_jobs, n_windows, block_size=N
         
         return dist_matrix
 
-def _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size=None, start_dask_client=False):
+def _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size=None):
     """
     Helper function for computing distance matrix using Dask.
     Optimized for distributed computation with improved chunking strategy.
@@ -796,30 +458,12 @@ def _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size=Non
         
         logger.info(f"Computing with Dask using {n_jobs} workers, block size: {block_size}")
         
-        # Try to get existing client or create new one
-        client = None
-        if not start_dask_client:
-            try:
-                from dask.distributed import get_client
-                client = get_client()
-                logger.info("Using existing Dask client")
-            except (ValueError, ImportError):
-                pass
-        
-        if client is None and start_dask_client:
-            from dask.distributed import Client, LocalCluster
-            # Create cluster with specific settings for distance computation
-            cluster = LocalCluster(
-                n_workers=n_jobs,
-                threads_per_worker=1,  # Better for CPU-bound tasks
-                processes=True,        # True process isolation
-                memory_limit='4GB',    # Prevent memory issues
-                scheduler_port=0       # Random port to avoid conflicts
-            )
-            client = Client(cluster)
-            logger.info(f"Started new Dask cluster with {n_jobs} workers")
-        
-        if client is None:
+        # Try to get existing client
+        try:
+            from dask.distributed import get_client
+            client = get_client()
+            logger.info("Using existing Dask client")
+        except (ValueError, ImportError):
             logger.warning("No Dask client available, falling back to joblib")
             return _compute_with_joblib(windows, distance_func, n_jobs, n_windows, block_size)
         
@@ -873,9 +517,6 @@ def _compute_with_dask(windows, distance_func, n_jobs, n_windows, block_size=Non
                     dist_matrix[j, i] = val  # Symmetric
             except Exception as e:
                 logger.error(f"Error processing chunk: {e}")
-        
-        if start_dask_client:
-            client.close()
             
         return dist_matrix
         
