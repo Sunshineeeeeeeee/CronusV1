@@ -7,9 +7,10 @@ from sklearn.preprocessing import StandardScaler
 import os
 from typing import Dict, List, Tuple, Optional, Union
 import datetime
+import torch.nn.functional as F
 
 # Import our signal processing module
-from advanced_signal_processing import SignalProcessor, extract_advanced_features
+from CronusV1.TTA.advanced_signal_processing_v1 import SignalProcessor, extract_advanced_features
 
 
 class EnhancedTradingDataset(Dataset):
@@ -58,426 +59,188 @@ class EnhancedTradingDataset(Dataset):
         return sample
 
 
-def prepare_enhanced_trading_data(
-    csv_path: str,
-    window_size: int = 50,
-    batch_size: int = 32,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    target_horizon: int = 50,         # 50 ticks ahead
-    profit_cap: float = 0.05,         # Cap profit at 5%
-    max_samples: Optional[int] = None,
-    random_seed: int = 42,
-    visualize: bool = False,
-    signal_window_sizes: List[int] = [8, 16, 32, 64],
-    results_dir: Optional[str] = None,
-    regime_mapping: Optional[dict] = None,
-    subregime_mapping: Optional[dict] = None,
-    disable_direction_correction: bool = False,
-    use_balanced_sampling: bool = False,
-    balance_threshold: float = 0.2
-) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
+def prepare_enhanced_trading_data(data_path, lookback_window=30, prediction_window=7, 
+                               batch_size=64, val_ratio=0.15, test_ratio=0.15,
+                               use_regime_feature=True, use_time_feature=True, device='cuda'):
     """
-    Prepare enhanced trading data with trend features, regimes, and time features.
+    Load and prepare enhanced trading data for training, validation, and testing.
+    Optimized for GPU acceleration.
     
-    Args:
-        csv_path: Path to CSV data file
-        window_size: Size of sliding window for sequence data
-        batch_size: Batch size for data loader
-        train_ratio: Ratio of data for training
-        val_ratio: Ratio of data for validation
-        test_ratio: Ratio of data for testing
-        target_horizon: Prediction horizon in ticks
-        profit_cap: Cap profit at this value
-        max_samples: Maximum number of samples to use (for testing)
-        random_seed: Random seed for reproducibility
-        visualize: Whether to generate visualizations
-        signal_window_sizes: Window sizes for signal processing
-        results_dir: Directory to save results
-        regime_mapping: Mapping from regime values to embedding indices
-        subregime_mapping: Mapping from subregime values to embedding indices
-        disable_direction_correction: Whether to disable automatic correction of trend direction
-        use_balanced_sampling: Whether to use class-balanced sampling for training
-        balance_threshold: Threshold for determining trend direction classes
-        
+    Parameters:
+        data_path (str): Path to the data file
+        lookback_window (int): Number of days to look back for features
+        prediction_window (int): Number of days to predict ahead
+        batch_size (int): Batch size for DataLoader
+        val_ratio (float): Ratio of data for validation set
+        test_ratio (float): Ratio of data for test set
+        use_regime_feature (bool): Whether to use regime feature
+        use_time_feature (bool): Whether to use time feature
+        device (str): Device to use for tensor operations ('cuda' or 'cpu')
+    
     Returns:
-        Tuple of DataLoaders for train, validation, and test sets, and metadata dictionary
+        tuple: (train_loader, val_loader, test_loader, feature_scaler)
     """
-    print("\nLoading data...")
-    print(f"Loading data from {csv_path}...")
+    # Load data
+    df = pd.read_csv(data_path)
     
-    # Set random seed
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
+    # Remove rows with NaN values
+    df = df.dropna()
     
-    # Read data
-    df = pd.read_csv(csv_path)
+    # Extract feature columns
+    feature_cols = [col for col in df.columns if col not in ['date', 'close']]
     
-    if max_samples is not None:
-        print(f"Limiting to {max_samples} samples for testing")
-        df = df.iloc[:max_samples + window_size + target_horizon]
+    # Initialize StandardScaler on CPU
+    feature_scaler = StandardScaler()
     
-    print(f"Data shape: {df.shape}")
+    # Scale features on CPU (StandardScaler doesn't work on GPU)
+    features_np = df[feature_cols].values
+    scaled_features_np = feature_scaler.fit_transform(features_np)
     
-    # Get the price column (typically 'close' or similar)
-    price_cols = [col for col in df.columns if col.lower() in ['close', 'price', 'last', 'value']]
-    if not price_cols:
-        raise ValueError("No price column found in data. Expected 'close', 'price', 'last', or 'value'")
-    price_col = price_cols[0]
-    print(f"Using '{price_col}' as the price column")
+    # Move to device only after preprocessing
+    features = torch.tensor(scaled_features_np, dtype=torch.float32, device=device)
+    prices = torch.tensor(df['close'].values, dtype=torch.float32, device=device)
     
-    # Calculate advanced trend features
-    print("Calculating advanced trend features...")
-    processor = SignalProcessor(window_sizes=signal_window_sizes)
-    trend_features = processor.calculate_multi_timeframe_trend(
-        df, price_col, disable_direction_correction=disable_direction_correction
-    )
+    # Calculate future prices and percentage changes in batch on GPU
+    with torch.no_grad():  # Disable gradient tracking for efficiency
+        future_prices = torch.roll(prices, shifts=-prediction_window, dims=0)
+        future_prices[-prediction_window:] = float('nan')
+        price_change_pct = (future_prices - prices) / prices * 100
     
-    # Add trend features to dataframe
-    df = pd.concat([df, trend_features], axis=1)
+    # Remove the last prediction_window rows that don't have valid targets
+    features = features[:-prediction_window]
+    prices = prices[:-prediction_window]
+    price_change_pct = price_change_pct[:-prediction_window]
     
-    # Create the target: future return over the horizon
-    df['future_return'] = df[price_col].pct_change(target_horizon).shift(-target_horizon)
-    
-    # Create profit target: capped absolute return
-    df['profit'] = df['future_return'].clip(lower=-profit_cap, upper=profit_cap)
-    
-    # Drop rows with NaN values
-    df = df.dropna(subset=['future_return', 'profit', 'weighted_trend_strength'])
-    
-    print(f"Data shape after dropping NaN: {df.shape}")
-    
-    # Identify feature columns (excluding target columns and metadata)
-    exclude_cols = ['profit', 'future_return', 'timestamp', 'datetime', 'date', 'time']
-    exclude_cols += ['trend_strength', 'trend_agreement', 'weighted_trend_strength']
-    exclude_cols += [f'trend_{w}' for w in signal_window_sizes]
-    
-    feature_cols = [col for col in df.columns if not any(excl in col.lower() for excl in exclude_cols)]
-    
-    # Standardize features (fit only on training data)
-    total_rows = len(df)
-    train_end_idx = int(total_rows * train_ratio)
-    train_df = df.iloc[:train_end_idx]
-    
-    # Scale numerical features
-    scaler = StandardScaler()
-    numerical_cols = [col for col in feature_cols if df[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
-    
-    if numerical_cols:
-        # Fit scaler on training data
-        scaler.fit(train_df[numerical_cols].values)
-        # Apply to all data
-        df[numerical_cols] = scaler.transform(df[numerical_cols].values)
-    
-    # Store numerical features as arrays
-    df['features'] = df[numerical_cols].values.tolist()
-    
-    # Identify regime columns if available
-    regime_cols = [col for col in df.columns if 'regime' in col.lower() and 'sub_regime' not in col.lower()]
-    sub_regime_cols = [col for col in df.columns if 'sub_regime' in col.lower()]
-    
-    # Create trend direction column using threshold
-    df['trend_direction'] = 0
-    df.loc[df['weighted_trend_strength'] > balance_threshold, 'trend_direction'] = 1
-    df.loc[df['weighted_trend_strength'] < -balance_threshold, 'trend_direction'] = -1
-    
-    # Print stats about the dataset
-    print(f"Total samples after preparation: {len(df)}")
-    print(f"Total features: {len(numerical_cols)}")
-    print(f"Trend strength range: {df['weighted_trend_strength'].min():.4f} to {df['weighted_trend_strength'].max():.4f}, "
-          f"mean: {df['weighted_trend_strength'].mean():.4f}")
-    
-    # Count direction classes
-    direction_counts = df['trend_direction'].value_counts()
-    print(f"Direction class distribution: Up={direction_counts.get(1, 0)}, "
-          f"Neutral={direction_counts.get(0, 0)}, Down={direction_counts.get(-1, 0)}")
-    
-    # Visualize the data distribution if requested
-    if visualize:
-        results_dir = results_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-        os.makedirs(results_dir, exist_ok=True)
-        
-        plt.figure(figsize=(15, 12))
-        
-        # Plot 1: Trend strength distribution
-        plt.subplot(2, 2, 1)
-        plt.hist(df['weighted_trend_strength'], bins=50)
-        plt.axvline(x=0, color='r', linestyle='--', alpha=0.5)
-        plt.title('Weighted Trend Strength Distribution')
-        plt.xlabel('Trend Strength')
-        plt.ylabel('Count')
-        
-        # Plot 2: Profit distribution
-        plt.subplot(2, 2, 2)
-        plt.hist(df['profit'], bins=50, alpha=0.75)
-        plt.axvline(x=0, color='r', linestyle='--', alpha=0.5)
-        plt.title('Profit Distribution')
-        plt.xlabel('Profit')
-        plt.ylabel('Count')
-        
-        # Plot 3: Trend strength vs profit
-        plt.subplot(2, 2, 3)
-        plt.scatter(df['weighted_trend_strength'], df['profit'], alpha=0.3)
-        plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        plt.axvline(x=0, color='r', linestyle='--', alpha=0.5)
-        plt.title('Trend Strength vs Profit')
-        plt.xlabel('Trend Strength')
-        plt.ylabel('Profit')
-        
-        # Plot 4: Trend agreement distribution
-        plt.subplot(2, 2, 4)
-        plt.hist(df['trend_agreement'], bins=20)
-        plt.title('Trend Agreement Distribution')
-        plt.xlabel('Agreement Level')
-        plt.ylabel('Count')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(results_dir, f"trend_data_distribution_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"))
-        plt.close()
-    
-    # Create sliding windows for sequential data
-    window_data = create_sliding_windows(df, window_size, 
-                                         feature_key='features',
-                                         trend_key='weighted_trend_strength',
-                                         regime_cols=regime_cols, 
-                                         sub_regime_cols=sub_regime_cols,
-                                         regime_mapping=regime_mapping,
-                                         subregime_mapping=subregime_mapping)
-    
-    # Split the windowed data into train, val, and test sets
-    total_windows = len(window_data['features'])
-    train_end_idx = int(total_windows * train_ratio)
-    val_end_idx = train_end_idx + int(total_windows * val_ratio)
-    
-    train_indices = range(0, train_end_idx)
-    val_indices = range(train_end_idx, val_end_idx)
-    test_indices = range(val_end_idx, total_windows)
-    
-    # Apply class-balanced sampling for training data if requested
-    if use_balanced_sampling:
-        print("\nApplying class-balanced sampling for training data...")
-        
-        # Get trend directions for all windows
-        trend_true = window_data['trend_strengths']
-        trend_directions = np.zeros_like(trend_true)
-        trend_directions[trend_true > balance_threshold] = 1
-        trend_directions[trend_true < -balance_threshold] = -1
-        
-        # Separate indices by direction class for the training set only
-        up_indices = np.where((trend_directions == 1) & (np.arange(len(trend_directions)) < train_end_idx))[0]
-        neutral_indices = np.where((trend_directions == 0) & (np.arange(len(trend_directions)) < train_end_idx))[0]
-        down_indices = np.where((trend_directions == -1) & (np.arange(len(trend_directions)) < train_end_idx))[0]
-        
-        # Print class counts
-        print(f"Original train class distribution: Up={len(up_indices)}, Neutral={len(neutral_indices)}, Down={len(down_indices)}")
-        
-        # Determine target count (min of all classes, but at least 100 samples)
-        min_class_count = min(len(up_indices), len(down_indices), len(neutral_indices))
-        target_count = max(min_class_count, min(100, len(up_indices), len(down_indices), len(neutral_indices)))
-        
-        # Sample from each class with replacement if needed
-        if target_count > 0:
-            balanced_up_indices = np.random.choice(up_indices, size=target_count, replace=(len(up_indices) < target_count))
-            balanced_neutral_indices = np.random.choice(neutral_indices, size=target_count, replace=(len(neutral_indices) < target_count))
-            balanced_down_indices = np.random.choice(down_indices, size=target_count, replace=(len(down_indices) < target_count))
+    # Optional: Prepare regime features
+    if use_regime_feature:
+        with torch.no_grad():
+            # Use efficient 1D convolution for moving averages
+            prices_1d = prices.view(1, 1, -1)
+            short_ma = torch.nn.functional.avg_pool1d(prices_1d, kernel_size=5, stride=1).view(-1)
+            long_ma = torch.nn.functional.avg_pool1d(prices_1d, kernel_size=20, stride=1).view(-1)
             
-            # Combine indices and shuffle
-            balanced_train_indices = np.concatenate([balanced_up_indices, balanced_neutral_indices, balanced_down_indices])
-            np.random.shuffle(balanced_train_indices)
+            # Pad the beginning of the short and long MAs
+            short_ma_padded = torch.cat([torch.full((4,), float('nan'), device=device), short_ma])[:prices.shape[0]]
+            long_ma_padded = torch.cat([torch.full((19,), float('nan'), device=device), long_ma])[:prices.shape[0]]
             
-            # Replace original train indices with balanced indices
-            train_indices = balanced_train_indices
+            # Vectorized regime calculation
+            regime = torch.where(short_ma_padded > long_ma_padded, 
+                                torch.ones(1, device=device),
+                                torch.full((1,), -1.0, device=device))
             
-            print(f"Balanced train class distribution: {target_count} samples per class, total {len(train_indices)} samples")
+            # Handle NaN values
+            regime_mask = torch.isnan(short_ma_padded) | torch.isnan(long_ma_padded)
+            regime = torch.where(regime_mask, torch.zeros(1, device=device), regime)
+            
+            # Add regime as a feature
+            regime = regime.view(-1, 1)
+            features = torch.cat([features, regime], dim=1)
     
-    # Create datasets
-    train_dataset = EnhancedTradingDataset(
-        features=window_data['features'][train_indices],
-        trend_strengths=window_data['trend_strengths'][train_indices],
-        profits=window_data['profits'][train_indices],
-        regimes=window_data.get('regimes', None)[train_indices] if 'regimes' in window_data else None,
-        subregimes=window_data.get('subregimes', None)[train_indices] if 'subregimes' in window_data else None,
-        time_features=window_data.get('time_features', None)[train_indices] if 'time_features' in window_data else None
-    )
+    # Optional: Prepare time features
+    if use_time_feature:
+        # Process dates on CPU
+        dates = pd.to_datetime(df['date'][:-prediction_window])
+        
+        # Create normalized time features and move to device
+        day_of_week = torch.tensor(dates.dt.dayofweek.values / 6, dtype=torch.float32, device=device).view(-1, 1)
+        day_of_month = torch.tensor(dates.dt.day.values / 31, dtype=torch.float32, device=device).view(-1, 1)
+        month = torch.tensor((dates.dt.month - 1) / 11, dtype=torch.float32, device=device).view(-1, 1)
+        
+        # Concatenate time features on GPU
+        features = torch.cat([features, day_of_week, day_of_month, month], dim=1)
     
-    val_dataset = EnhancedTradingDataset(
-        features=window_data['features'][val_indices],
-        trend_strengths=window_data['trend_strengths'][val_indices],
-        profits=window_data['profits'][val_indices],
-        regimes=window_data.get('regimes', None)[val_indices] if 'regimes' in window_data else None,
-        subregimes=window_data.get('subregimes', None)[val_indices] if 'subregimes' in window_data else None,
-        time_features=window_data.get('time_features', None)[val_indices] if 'time_features' in window_data else None
-    )
+    # Create sliding windows efficiently on GPU
+    feature_windows = create_sliding_windows(features, lookback_window)
     
-    test_dataset = EnhancedTradingDataset(
-        features=window_data['features'][test_indices],
-        trend_strengths=window_data['trend_strengths'][test_indices],
-        profits=window_data['profits'][test_indices],
-        regimes=window_data.get('regimes', None)[test_indices] if 'regimes' in window_data else None,
-        subregimes=window_data.get('subregimes', None)[test_indices] if 'subregimes' in window_data else None,
-        time_features=window_data.get('time_features', None)[test_indices] if 'time_features' in window_data else None
-    )
+    # Align targets with the windows
+    targets = price_change_pct[lookback_window-1:]
     
-    # Create data loaders
+    # Filter out windows with NaN targets
+    valid_indices = ~torch.isnan(targets)
+    feature_windows = feature_windows[valid_indices]
+    targets = targets[valid_indices]
+    
+    # Calculate dataset sizes
+    total_samples = feature_windows.size(0)
+    test_size = int(total_samples * test_ratio)
+    val_size = int(total_samples * val_ratio)
+    train_size = total_samples - test_size - val_size
+    
+    # Split datasets efficiently on GPU
+    train_features = feature_windows[:train_size]
+    train_targets = targets[:train_size]
+    
+    val_features = feature_windows[train_size:train_size+val_size]
+    val_targets = targets[train_size:train_size+val_size]
+    
+    test_features = feature_windows[train_size+val_size:]
+    test_targets = targets[train_size+val_size:]
+    
+    # Create TensorDatasets
+    train_dataset = torch.utils.data.TensorDataset(train_features, train_targets.view(-1, 1))
+    val_dataset = torch.utils.data.TensorDataset(val_features, val_targets.view(-1, 1))
+    test_dataset = torch.utils.data.TensorDataset(test_features, test_targets.view(-1, 1))
+    
+    # Create optimized DataLoaders for GPU
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_batch
+        batch_size=batch_size, 
+        shuffle=True, 
+        pin_memory=(device == 'cuda'),  # Pin memory for faster transfers
+        num_workers=4 if device == 'cuda' else 0,  # Parallelize data loading when using GPU
+        persistent_workers=True if device == 'cuda' else False,  # Keep workers alive between batches
+        prefetch_factor=2 if device == 'cuda' else None  # Prefetch batches
     )
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_batch
+        batch_size=batch_size, 
+        shuffle=False, 
+        pin_memory=(device == 'cuda'),
+        num_workers=4 if device == 'cuda' else 0,
+        persistent_workers=True if device == 'cuda' else False,
+        prefetch_factor=2 if device == 'cuda' else None
     )
     
     test_loader = DataLoader(
         test_dataset, 
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_batch
+        batch_size=batch_size, 
+        shuffle=False, 
+        pin_memory=(device == 'cuda'),
+        num_workers=4 if device == 'cuda' else 0,
+        persistent_workers=True if device == 'cuda' else False,
+        prefetch_factor=2 if device == 'cuda' else None
     )
     
-    # Create metadata for the loaders
-    metadata = {
-        'dataset_size': total_windows,
-        'train_size': len(train_dataset),
-        'val_size': len(val_dataset),
-        'test_size': len(test_dataset),
-        'feature_dim': window_data['features'][0].shape[-1] if len(window_data['features']) > 0 else 0,
-        'window_size': window_size,
-        'target_horizon': target_horizon,
-        'signal_processing': {
-            'window_sizes': signal_window_sizes
-        },
-        'balance_threshold': balance_threshold,
-        'balanced_sampling': use_balanced_sampling
-    }
-    
-    return train_loader, val_loader, test_loader, metadata
+    return train_loader, val_loader, test_loader, feature_scaler
 
 
-def create_sliding_windows(df: pd.DataFrame, window_size: int, 
-                           feature_key: str = 'features',
-                           trend_key: str = 'weighted_trend_strength',
-                           regime_cols: List[str] = None, 
-                           sub_regime_cols: List[str] = None,
-                           regime_mapping: dict = None,
-                           subregime_mapping: dict = None) -> Dict[str, np.ndarray]:
+def create_sliding_windows(data, window_size):
     """
-    Create sliding windows for sequential data.
+    Create sliding windows of features for sequential data.
+    Optimized for GPU processing with efficient tensor operations.
     
-    Args:
-        df: DataFrame containing data
-        window_size: Size of each window
-        feature_key: Column containing feature vectors
-        trend_key: Column containing trend strength values
-        regime_cols: Columns containing regime information
-        sub_regime_cols: Columns containing sub-regime information
-        regime_mapping: Dictionary mapping regime values to indices
-        subregime_mapping: Dictionary mapping subregime values to indices
+    Parameters:
+        data (torch.Tensor): Input tensor with shape [sequence_length, feature_dim]
+        window_size (int): Size of the sliding window
     
     Returns:
-        Dictionary containing windowed data arrays
+        torch.Tensor: Tensor with sliding windows [num_windows, window_size, feature_dim]
     """
-    # Convert features from list of arrays to numpy array
-    features = np.array(df[feature_key].tolist())
+    # Get sequence length and feature dimension
+    seq_len, feat_dim = data.shape
     
-    # Get total samples and feature dimension
-    n_samples = len(df) - window_size
-    feature_dim = features.shape[1]
+    # Calculate number of windows
+    num_windows = seq_len - window_size + 1
     
-    # Initialize arrays to store windowed data
-    windowed_features = np.zeros((n_samples, window_size, feature_dim), dtype=np.float32)
-    trend_strengths = np.zeros(n_samples, dtype=np.float32)
-    profits = np.zeros(n_samples, dtype=np.float32)
+    # Using efficient unfold operation for creating sliding windows
+    # This avoids explicit loops and is optimized for GPU execution
+    windows = data.unfold(0, window_size, 1)
     
-    # Create time features (relative position and hour of day)
-    time_features = np.zeros((n_samples, window_size, 2), dtype=np.float32)
+    # No need to create a new tensor with cat operations
+    # The unfold operation directly returns the correct shape [num_windows, window_size, feature_dim]
     
-    # Create windows for regimes if available
-    regimes = None
-    subregimes = None
-    
-    if regime_cols and len(regime_cols) > 0:
-        regimes = np.zeros((n_samples, window_size), dtype=np.int32)
-    
-    if sub_regime_cols and len(sub_regime_cols) > 0:
-        subregimes = np.zeros((n_samples, window_size), dtype=np.int32)
-    
-    # Create sliding windows
-    for i in range(n_samples):
-        # Extract window
-        window_slice = slice(i, i + window_size)
-        
-        # Features - combine window of input features
-        for j in range(window_size):
-            windowed_features[i, j] = features[i + j]
-        
-        # Target values (from the last point in the window)
-        trend_strengths[i] = df[trend_key].iloc[i + window_size - 1]
-        profits[i] = df['profit'].iloc[i + window_size - 1]
-        
-        # Time features
-        # 1. Relative position in window (0 to 1)
-        time_features[i, :, 0] = np.linspace(0, 1, window_size)
-        
-        # 2. Hour of day (if timestamp is available)
-        if 'timestamp' in df.columns or 'datetime' in df.columns:
-            timestamp_col = 'timestamp' if 'timestamp' in df.columns else 'datetime'
-            
-            try:
-                # Try to convert to datetime if it's not already
-                timestamps = pd.to_datetime(df[timestamp_col].iloc[window_slice])
-                
-                # Extract hour and normalize to [0, 1]
-                hours = timestamps.dt.hour + timestamps.dt.minute / 60.0
-                time_features[i, :, 1] = hours / 24.0
-            except:
-                # If conversion fails, use zeros
-                time_features[i, :, 1] = 0
-        
-        # Extract regime information if available
-        if regime_cols and len(regime_cols) > 0:
-            raw_regimes = df[regime_cols[0]].iloc[window_slice].values
-            # Map regimes to indices if mapping is provided
-            if regime_mapping is not None:
-                for j, r in enumerate(raw_regimes):
-                    regimes[i, j] = regime_mapping.get(r, 0)  # Default to 0 if not found
-            else:
-                regimes[i] = raw_regimes
-        
-        # Extract subregime information if available
-        if sub_regime_cols and len(sub_regime_cols) > 0:
-            raw_subregimes = df[sub_regime_cols[0]].iloc[window_slice].values
-            # Map subregimes to indices if mapping is provided
-            if subregime_mapping is not None:
-                for j, sr in enumerate(raw_subregimes):
-                    subregimes[i, j] = subregime_mapping.get(sr, 0)  # Default to 0 if not found
-            else:
-                subregimes[i] = raw_subregimes
-    
-    # Create output dictionary
-    windowed_data = {
-        'features': windowed_features,
-        'trend_strengths': trend_strengths,
-        'profits': profits,
-        'time_features': time_features
-    }
-    
-    if regimes is not None:
-        windowed_data['regimes'] = regimes
-    
-    if subregimes is not None:
-        windowed_data['subregimes'] = subregimes
-    
-    return windowed_data
+    return windows
 
 
 def collate_batch(batch):
@@ -518,6 +281,56 @@ def collate_batch(batch):
         'subregimes': subregimes_tensor,
         'time_features': time_features_tensor
     }
+
+
+def build_regime_feature(features, prices, window_sizes=[5, 10, 20, 50, 100, 200]):
+    """
+    Build market regime features using efficient GPU operations.
+    
+    Parameters:
+        features (torch.Tensor): Feature tensor
+        prices (torch.Tensor): Price tensor
+        window_sizes (list): List of window sizes for moving averages
+    
+    Returns:
+        torch.Tensor: Combined features including regime indicators
+    """
+    device = features.device
+    
+    # Calculate market regimes based on moving averages
+    with torch.no_grad():
+        # Prepare convolution layer for efficient moving average calculation
+        regime_features = []
+        
+        # Create 1D convolution kernels for each window size
+        for window_size in window_sizes:
+            # Create convolution kernel (equal weights)
+            kernel = torch.ones(1, 1, window_size, device=device) / window_size
+            
+            # Pad the price tensor to handle boundary cases
+            padded_prices = F.pad(prices.view(1, 1, -1), (window_size-1, 0))
+            
+            # Apply convolution to calculate moving average
+            ma = F.conv1d(padded_prices, kernel).view(-1)
+            
+            # Calculate regime indicator (price relative to moving average)
+            regime = torch.zeros_like(prices, device=device)
+            valid_indices = torch.arange(prices.size(0), device=device)
+            
+            # Vectorized comparison
+            regime = torch.where(prices > ma, torch.tensor(1.0, device=device), 
+                               torch.where(prices < ma, torch.tensor(-1.0, device=device), 
+                                         torch.tensor(0.0, device=device)))
+            
+            regime_features.append(regime)
+    
+    # Efficiently stack all regime features
+    all_regime_features = torch.stack(regime_features, dim=1)
+    
+    # Combine with original features
+    combined_features = torch.cat([features, all_regime_features], dim=1)
+    
+    return combined_features
 
 
 if __name__ == "__main__":

@@ -9,6 +9,9 @@ from sklearn.preprocessing import StandardScaler
 from Feature_engineering.feature_extraction import FeatureExtractor
 import os
 import glob
+import multiprocessing
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+import time
 
 class PositionalEncoding(nn.Module):
     """
@@ -1003,6 +1006,36 @@ class MaskedTemporalEncoder(nn.Module):
         
         return features
 
+class MicrostructureDataset(Dataset):
+    """
+    Dataset class for microstructure data to enable efficient data loading.
+    """
+    def __init__(self, values, time_features, attention_mask=None):
+        """
+        Initialize the dataset with tensors.
+        
+        Parameters:
+        -----------
+        values : torch.Tensor
+            Input values tensor of shape (batch, seq_len, input_size)
+        time_features : torch.Tensor
+            Time features tensor of shape (batch, seq_len, time_features_size)
+        attention_mask : torch.Tensor, optional
+            Attention mask tensor of shape (batch, seq_len)
+        """
+        self.values = values
+        self.time_features = time_features
+        self.attention_mask = attention_mask
+        
+    def __len__(self):
+        return len(self.values)
+    
+    def __getitem__(self, idx):
+        if self.attention_mask is not None:
+            return self.values[idx], self.time_features[idx], self.attention_mask[idx]
+        else:
+            return self.values[idx], self.time_features[idx]
+
 # Helper functions for processing data with the enhanced model
 
 def prepare_microstructure_data(
@@ -1010,7 +1043,8 @@ def prepare_microstructure_data(
     feature_extractor: FeatureExtractor,
     context_length: int = 50,
     timestamp_col: str = 'Timestamp',
-    causal: bool = True
+    causal: bool = True,
+    stride: int = 1
 ) -> Dict[str, torch.Tensor]:
     """
     Prepare data for model training by creating tensors using the FeatureExtractor.
@@ -1028,6 +1062,8 @@ def prepare_microstructure_data(
     causal : bool
         If True, use causal mode (only past information) for real-time applications
         If False, use bidirectional context (WARNING: creates future leakage, research only)
+    stride : int
+        Stride for window creation (subsampling for large datasets)
         
     Returns:
     --------
@@ -1039,7 +1075,7 @@ def prepare_microstructure_data(
     
     # Create tensors for time, features, and timedeltas
     time_tensor, features_tensor, timedelta_tensor = feature_extractor.create_tensors(
-        feature_df, timestamp_col=timestamp_col, window_size=context_length, causal=causal
+        feature_df, timestamp_col=timestamp_col, window_size=context_length, causal=causal, stride=stride
     )
     
     # Create attention mask (1 for valid tokens, 0 for padding/masked tokens)
@@ -1066,10 +1102,17 @@ def train_masked_model(
     gamma: float = 0.2,
     warmup_epochs: int = 10,
     verbose: bool = True,
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 15,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    gradient_accumulation_steps: int = 1,  # Added for larger effective batch sizes
+    use_amp: bool = True,  # Added explicit control over mixed precision
+    amp_dtype: torch.dtype = torch.float16,  # Added dtype option for mixed precision
+    pin_memory: bool = True,  # Explicitly pin memory for faster GPU transfers
+    benchmark_mode: bool = True  # Enable cudnn benchmark mode for optimized kernels
 ) -> Dict[str, List[float]]:
     """
-    Train the masked temporal encoder model with learning rate scheduling.
+    Train the masked temporal encoder model with optimized GPU performance.
     
     Parameters:
     -----------
@@ -1093,6 +1136,20 @@ def train_masked_model(
         Whether to print progress
     early_stopping_patience : int
         Number of epochs to wait for improvement before early stopping
+    batch_size : int
+        Batch size for training
+    num_workers : int
+        Number of worker processes for data loading
+    gradient_accumulation_steps : int
+        Number of steps to accumulate gradients (allows larger effective batch sizes)
+    use_amp : bool
+        Whether to use automatic mixed precision (AMP) to improve training speed
+    amp_dtype : torch.dtype
+        Data type to use for AMP (usually torch.float16 or torch.bfloat16)
+    pin_memory : bool
+        Whether to pin memory for faster GPU transfers
+    benchmark_mode : bool
+        Whether to enable cudnn benchmark mode for optimized GPU kernels
         
     Returns:
     --------
@@ -1103,8 +1160,31 @@ def train_masked_model(
     if device is None:
         device = model.device
     
-    # Move data to device
-    train_data = {k: v.to(device) for k, v in train_data.items()}
+    # Enable cudnn benchmark mode for optimized GPU kernels if requested
+    if benchmark_mode and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    
+    # Create dataset from tensors
+    dataset = MicrostructureDataset(
+        train_data["values"],
+        train_data["time_features"],
+        train_data.get("attention_mask", None)
+    )
+    
+    # Log input data dimensions
+    print(f"Training on {len(dataset)} samples with shape: {train_data['values'].shape}")
+    
+    # Create dataloader with optimized settings
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=True  # Prevents issues with small remaining batches
+    )
     
     # Training history
     history = {
@@ -1130,8 +1210,39 @@ def train_masked_model(
     patience_counter = 0
     best_model_state = None
     
+    # For mixed precision training
+    # Check if device is CUDA using the correct method for torch.device objects
+    use_cuda = torch.cuda.is_available() and (
+        str(device).startswith('cuda') if isinstance(device, torch.device) else device.startswith('cuda')
+    )
+    
+    # Setup mixed precision training
+    if use_amp and use_cuda:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        if verbose:
+            print(f"Using Automatic Mixed Precision (AMP) with {amp_dtype}")
+    else:
+        scaler = None
+        if use_amp and not use_cuda:
+            print("Warning: AMP requested but CUDA not available. Falling back to full precision.")
+    
+    # GPU memory optimization
+    if use_cuda:
+        # Empty cache before starting training
+        torch.cuda.empty_cache()
+        
+        # Log GPU stats
+        if verbose:
+            gpu_name = torch.cuda.get_device_name(0)
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"Using GPU: {gpu_name} | Memory: {mem_allocated:.2f}GB allocated / {mem_total:.2f}GB total")
+    
     # Training loop
+    total_steps = 0
+    
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
         epoch_metrics = {k: 0.0 for k in history.keys()}
         num_batches = 0
         
@@ -1140,24 +1251,19 @@ def train_masked_model(
             lr = initial_lr * ((epoch + 1) / warmup_epochs)
             for param_group in model.optimizer.param_groups:
                 param_group['lr'] = lr
-        
-        # Generate random batch indices
-        batch_size = model.batch_size
-        num_samples = train_data["values"].shape[0]
-        indices = np.random.permutation(num_samples)
-        
-        for batch_start in range(0, num_samples, batch_size):
-            # Get batch indices
-            batch_indices = indices[batch_start:min(batch_start+batch_size, num_samples)]
+                
+        # Loop through batches
+        for batch_idx, (batch_values, batch_time_features, *batch_extras) in enumerate(dataloader):
+            total_steps += 1
             
-            # Extract batch data
-            batch_values = train_data["values"][batch_indices]
-            batch_time_features = train_data["time_features"][batch_indices]
+            # Move data to device (non-blocking for async transfer)
+            batch_values = batch_values.to(device, non_blocking=True)
+            batch_time_features = batch_time_features.to(device, non_blocking=True)
             
             # Get attention mask if available
             batch_attention_mask = None
-            if "attention_mask" in train_data:
-                batch_attention_mask = train_data["attention_mask"][batch_indices]
+            if len(batch_extras) > 0:
+                batch_attention_mask = batch_extras[0].to(device, non_blocking=True)
             
             # Adjust loss weights over time
             if epoch < warmup_epochs:
@@ -1172,21 +1278,93 @@ def train_masked_model(
                 current_beta = beta * (1.0 + progress)  # Increase
                 current_gamma = gamma * (1.0 + progress * 0.5)  # Slightly increase
             
-            # Perform training step
-            batch_metrics = model.train_step(
-                values=batch_values,
-                time_features=batch_time_features,
-                attention_mask=batch_attention_mask,
-                alpha=current_alpha,
-                beta=current_beta,
-                gamma=current_gamma
-            )
+            # Only reset gradients at the beginning of gradient accumulation cycle
+            if batch_idx % gradient_accumulation_steps == 0:
+                model.optimizer.zero_grad()
+            
+            # Use mixed precision training if available
+            if scaler is not None:
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                    # Forward pass
+                    model_output = model.forward(
+                        values=batch_values,
+                        time_features=batch_time_features,
+                        apply_masking=True,
+                        attention_mask=batch_attention_mask
+                    )
+                    
+                    # Compute loss
+                    loss_dict = model.compute_loss(
+                        model_output=model_output, 
+                        values=batch_values, 
+                        alpha=current_alpha, 
+                        beta=current_beta, 
+                        gamma=current_gamma
+                    )
+                    
+                    # Adjust loss for gradient accumulation
+                    if gradient_accumulation_steps > 1:
+                        loss_dict["total_loss"] = loss_dict["total_loss"] / gradient_accumulation_steps
+                
+                # Backward pass with gradient scaling
+                scaler.scale(loss_dict["total_loss"]).backward()
+                
+                # Optimize only after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                    # Unscale gradients for clipping
+                    scaler.unscale_(model.optimizer)
+                    
+                    # Clip gradients to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step with scaler
+                    scaler.step(model.optimizer)
+                    scaler.update()
+            else:
+                # Standard precision training
+                # Forward pass
+                model_output = model.forward(
+                    values=batch_values,
+                    time_features=batch_time_features,
+                    apply_masking=True,
+                    attention_mask=batch_attention_mask
+                )
+                
+                # Compute loss
+                loss_dict = model.compute_loss(
+                    model_output=model_output, 
+                    values=batch_values, 
+                    alpha=current_alpha, 
+                    beta=current_beta, 
+                    gamma=current_gamma
+                )
+                
+                # Adjust loss for gradient accumulation
+                if gradient_accumulation_steps > 1:
+                    loss_dict["total_loss"] = loss_dict["total_loss"] / gradient_accumulation_steps
+                
+                # Backward pass
+                loss_dict["total_loss"].backward()
+                
+                # Optimize only after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                    # Clip gradients to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step
+                    model.optimizer.step()
+                    model.optimizer.zero_grad()
             
             # Update epoch metrics
-            for k, v in batch_metrics.items():
-                epoch_metrics[k] += v
+            for k, v in loss_dict.items():
+                epoch_metrics[k] += v.item()
                 
             num_batches += 1
+            
+            # Log progress periodically
+            if verbose and (batch_idx + 1) % max(1, len(dataloader) // 5) == 0:
+                cur_loss = epoch_metrics['total_loss'] / num_batches
+                print(f"Epoch {epoch+1}/{num_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {cur_loss:.6f}")
         
         # Calculate average metrics for the epoch
         for k in epoch_metrics.keys():
@@ -1200,25 +1378,38 @@ def train_masked_model(
         if epoch_metrics['total_loss'] < best_loss:
             best_loss = epoch_metrics['total_loss']
             patience_counter = 0
-            # Save best model state
+            # Store best model weights
             best_model_state = {k: v.cpu().detach() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
             if patience_counter >= early_stopping_patience:
                 if verbose:
                     print(f"Early stopping triggered after {epoch+1} epochs")
-                # Restore best model
-                if best_model_state is not None:
-                    model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
                 break
         
-        # Print progress
-        if verbose and (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} - " + 
-                  f"Loss: {epoch_metrics['total_loss']:.4f} - " +
-                  f"Contrastive: {epoch_metrics['contrastive_loss']:.4f} - " +
-                  f"Entropy: {epoch_metrics['entropy_loss']:.4f} - " +
-                  f"Diversity: {epoch_metrics['attention_diversity_loss']:.4f}")
+        # Log epoch results
+        epoch_time = time.time() - epoch_start_time
+        samples_per_sec = len(dataset) / epoch_time
+        
+        if verbose:
+            print(f"Epoch {epoch+1}/{num_epochs} completed in {epoch_time:.2f}s ({samples_per_sec:.1f} samples/s)")
+            print(f"Loss: {epoch_metrics['total_loss']:.6f} | LR: {model.optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Log memory usage
+            if use_cuda:
+                mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                mem_reserved = torch.cuda.max_memory_allocated(0) / 1024**3
+                print(f"GPU Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB peak")
+                # Reset peak memory stats
+                torch.cuda.reset_peak_memory_stats()
+    
+    # Restore best model
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+    
+    # Final cleanup
+    if use_cuda:
+        torch.cuda.empty_cache()
     
     return history
 
@@ -1533,7 +1724,17 @@ def process_market_data(
     num_encoder_layers: int = 3,
     causal: bool = True,  # Use causal mode for real-time applications
     temperature: float = 0.5,
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 1.0,
+    batch_size: int = 128,  # Increased batch size for better GPU utilization
+    num_workers: Optional[int] = None,  # Auto-detect optimal number of workers
+    use_amp: bool = True,  # Enable automatic mixed precision
+    gradient_accumulation_steps: int = 1,  # Gradient accumulation for large batches
+    precision: str = 'float16',  # Precision for mixed precision training
+    window_stride: int = 1,  # Stride for window creation
+    extract_features_mode: str = "all",  # Can be "all" or "mean"
+    # Increase default stride to reduce memory usage on RTX GPUs
+    batch_shrink_factor: float = 0.5,  # Factor to reduce batch size if OOM occurs
+    memory_efficient: bool = False,  # Use memory efficient attention
 ) -> Tuple[pd.DataFrame, Optional[MaskedTemporalEncoder]]:
     """
     Process market data to extract volatility regime features.
@@ -1562,18 +1763,83 @@ def process_market_data(
         Temperature parameter for contrastive loss (lower = sharper contrasts)
     grad_clip_norm : float
         Maximum norm for gradient clipping
+    batch_size : int
+        Batch size for training and inference
+    num_workers : int, optional
+        Number of worker processes for data loading. If None, will auto-detect.
+    use_amp : bool
+        Whether to use automatic mixed precision training
+    gradient_accumulation_steps : int
+        Number of steps to accumulate gradients before updating weights
+    precision : str
+        Precision to use for mixed precision training ('float16' or 'bfloat16')
+    window_stride : int
+        Stride for window creation (subsampling for large datasets)
+    extract_features_mode : str
+        Mode for feature extraction: 'all' (extract for all windows) or 'mean' (extract mean features)
+    batch_shrink_factor : float
+        Factor to reduce batch size if OOM occurs
+    memory_efficient : bool
+        Use memory efficient attention
         
     Returns:
     --------
     Tuple[pd.DataFrame, Optional[MaskedTemporalEncoder]]
         DataFrame with extracted features and the model (if retrained)
     """
+    # Import the RTX 4090 config if available
+    try:
+        from Feature_engineering.rtx_4090_config import get_max_gpu_config, compile_model_if_supported
+        # Use optimized config for RTX 4090
+        max_config = get_max_gpu_config(len(df))
+        # Override parameters with RTX 4090 optimized settings if not explicitly specified
+        if num_epochs == 20:  # Default value, not explicitly specified
+            num_epochs = max_config.get("num_epochs", num_epochs)
+        if context_length == 50:  # Default value, not explicitly specified
+            context_length = max_config.get("context_length", context_length)
+        if num_attention_heads == 8:  # Default value, not explicitly specified
+            num_attention_heads = max_config.get("num_attention_heads", num_attention_heads)
+        if num_encoder_layers == 3:  # Default value, not explicitly specified
+            num_encoder_layers = max_config.get("num_encoder_layers", num_encoder_layers)
+        if temperature == 0.5:  # Default value, not explicitly specified
+            temperature = max_config.get("temperature", temperature)
+        if batch_size == 128:  # Default value, not explicitly specified
+            batch_size = max_config.get("batch_size", batch_size)
+        if num_workers is None:  # Default value, not explicitly specified
+            num_workers = max_config.get("num_workers", min(os.cpu_count() or 4, 8))
+        if precision == 'float16':  # Default value, not explicitly specified
+            precision = max_config.get("precision", precision)
+        if window_stride == 1:  # Default value, not explicitly specified
+            window_stride = max_config.get("window_stride", window_stride)
+        print("Using RTX 4090 optimized configuration")
+    except ImportError:
+        # If the config file doesn't exist, use default settings
+        if num_workers is None:
+            num_workers = min(os.cpu_count() or 4, 8)  # Use at most 8 workers
+        print("Using default configuration (RTX 4090 config not found)")
+
     # Create directories
     os.makedirs(model_dir, exist_ok=True)
     
     # Suppress all warnings
     import warnings
     warnings.filterwarnings("ignore")
+    
+    # Determine mixed precision dtype
+    if precision == 'bfloat16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    
+    # Enable cuDNN benchmark mode for optimized GPU performance
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        
+        # Additional optimizations for RTX GPUs
+        if 'RTX' in torch.cuda.get_device_name(0):
+            # Enable TF32 for matrix multiplications (almost FP32 precision with FP16 speed)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
     
     # Assume timestamp column is 'Timestamp' by default
     timestamp_col = 'Timestamp'
@@ -1582,6 +1848,10 @@ def process_market_data(
     print(f"Model {'will be trained and saved to' if retrain else 'will be loaded from'}: {model_dir}")
     print(f"Using {'causal' if causal else 'bidirectional'} mode. " + 
           f"{'(Suitable for real-time applications)' if causal else '(WARNING: Contains future leakage! Research use only)'}")
+    print(f"GPU optimization: batch_size={batch_size}, num_workers={num_workers}, use_amp={use_amp}, gradient_accumulation_steps={gradient_accumulation_steps}")
+    
+    # Print original data size
+    print(f"Input data size: {len(df)} rows")
     
     # Setup feature extractor
     print("Setting up feature extractor...")
@@ -1593,6 +1863,7 @@ def process_market_data(
     feature_df = feature_extractor.extract_features(df, timestamp_col=timestamp_col)
     
     print(f"Extracted {feature_extractor.get_feature_count()} microstructure features")
+    print(f"Feature data size after extraction: {len(feature_df)} rows")
     
     # Prepare data tensors
     print("Preparing data tensors...")
@@ -1601,7 +1872,8 @@ def process_market_data(
         feature_extractor=feature_extractor,
         context_length=context_length,
         timestamp_col=timestamp_col,
-        causal=causal  # Pass causal mode to data preparation
+        causal=causal,  # Pass causal mode to data preparation
+        stride=window_stride  # Pass stride parameter to control window creation
     )
     
     print(f"Data shapes - Values: {data['values'].shape}, Time: {data['time_features'].shape}")
@@ -1627,8 +1899,15 @@ def process_market_data(
         'jumps': jump_indices,
     }
     
-    # Set device
+    # Set device with proper CUDA optimization
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Log GPU information if available
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU: {gpu_name} with {total_memory:.2f}GB memory")
     
     model = None
     features = None
@@ -1638,14 +1917,18 @@ def process_market_data(
         # Create and train new model
         print("Training new model...")
         
+        # For RTX 4090, increase the model size
+        d_model = 768 if torch.cuda.is_available() and 'RTX' in torch.cuda.get_device_name(0) else 128
+        dim_feedforward = 2048 if torch.cuda.is_available() and 'RTX' in torch.cuda.get_device_name(0) else 256
+        
         model = MaskedTemporalEncoder(
             input_size=data['values'].shape[2],
             context_length=context_length,
-            d_model=128,
+            d_model=d_model,
             num_encoder_layers=num_encoder_layers,
             num_attention_heads=num_attention_heads,
-            dim_feedforward=256,
-            batch_size=32,
+            dim_feedforward=dim_feedforward,
+            batch_size=batch_size,  # Use larger batch size
             mask_ratio=0.15,
             temperature=temperature,
             feature_groups=feature_groups,
@@ -1656,15 +1939,27 @@ def process_market_data(
         model.to(device)
         print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
         
+        # Try to compile the model if PyTorch 2.0+ is available
+        try:
+            from Feature_engineering.rtx_4090_config import compile_model_if_supported
+            model = compile_model_if_supported(model)
+        except (ImportError, Exception):
+            pass
+        
         # Create proper attention mask (False values indicate valid positions)
-        batch_size, seq_len = data['values'].shape[0], data['values'].shape[1]
-        attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+        batch_size_data, seq_len = data['values'].shape[0], data['values'].shape[1]
+        attention_mask = torch.zeros((batch_size_data, seq_len), dtype=torch.bool)
         data['attention_mask'] = attention_mask
         
-        # Move data to device
-        data = {k: v.to(device) for k, v in data.items()}
+        # Create Dataset and DataLoader rather than directly passing tensors
+        # The dataloader will handle batch creation and parallel loading
+        train_dataset = MicrostructureDataset(
+            data['values'],
+            data['time_features'],
+            data['attention_mask']
+        )
         
-        # Train model
+        # Train model with optimized parameters
         train_masked_model(
             model=model,
             train_data=data,
@@ -1674,7 +1969,14 @@ def process_market_data(
             beta=0.2,
             gamma=0.1,
             warmup_epochs=min(5, num_epochs // 4),
-            verbose=True
+            verbose=True,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            pin_memory=True,
+            benchmark_mode=True
         )
         
         # Save model
@@ -1706,15 +2008,19 @@ def process_market_data(
         if not check_model_compatibility(newest_model, input_size, verbose=True):
             print("WARNING: Model is not compatible with current data. Creating a new model...")
             
+            # For RTX 4090, increase the model size
+            d_model = 768 if torch.cuda.is_available() and 'RTX' in torch.cuda.get_device_name(0) else 128
+            dim_feedforward = 2048 if torch.cuda.is_available() and 'RTX' in torch.cuda.get_device_name(0) else 256
+            
             # Create a new model with current data shape
             model = MaskedTemporalEncoder(
                 input_size=input_size,
                 context_length=context_length,
-                d_model=128,
+                d_model=d_model,
                 num_encoder_layers=num_encoder_layers,
                 num_attention_heads=num_attention_heads,
-                dim_feedforward=256,
-                batch_size=32,
+                dim_feedforward=dim_feedforward,
+                batch_size=batch_size,  # Use larger batch size
                 mask_ratio=0.15,
                 temperature=temperature,
                 feature_groups=feature_groups,
@@ -1722,14 +2028,21 @@ def process_market_data(
                 causal=causal  # Pass causal mode to model
             )
             
-            # Train the model with a few epochs
-            batch_size, seq_len = data['values'].shape[0], data['values'].shape[1]
-            attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+            # Try to compile the model if PyTorch 2.0+ is available
+            try:
+                from Feature_engineering.rtx_4090_config import compile_model_if_supported
+                model = compile_model_if_supported(model)
+            except (ImportError, Exception):
+                pass
+                
+            # Create dataset for training
+            batch_size_data, seq_len = data['values'].shape[0], data['values'].shape[1]
+            attention_mask = torch.zeros((batch_size_data, seq_len), dtype=torch.bool)
             data['attention_mask'] = attention_mask
-            data = {k: v.to(device) for k, v in data.items()}
             
             print("Training model with new data shape...")
             
+            # Train model with optimized parameters
             train_masked_model(
                 model=model,
                 train_data=data,
@@ -1739,7 +2052,14 @@ def process_market_data(
                 beta=0.2,
                 gamma=0.1,
                 warmup_epochs=1,
-                verbose=True
+                verbose=True,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                pin_memory=True,
+                benchmark_mode=True
             )
             
             # Save the new model
@@ -1759,47 +2079,62 @@ def process_market_data(
     # Extract features
     print("Extracting features...")
     
-    # Process in smaller batches to avoid memory issues
-    batch_size = 32
-    all_features = []
-    num_samples = len(df) - context_length + 1
+    # Use DataLoader for feature extraction to improve GPU utilization
+    # Create TensorDataset from data tensors
+    extract_dataset = TensorDataset(
+        data['values'],
+        data['time_features'],
+        data['attention_mask'] if 'attention_mask' in data else torch.zeros_like(data['values'][:,:,0], dtype=torch.bool)
+    )
+        
+    # Create DataLoader with optimized settings
+    extract_loader = DataLoader(
+        extract_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # No need to shuffle for extraction
+        num_workers=num_workers,
+        pin_memory=True,  # Faster data transfer to GPU
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=False  # Don't drop the last batch to keep all data
+    )
+        
+    # Move model to evaluation mode
+    model.eval()
     
-    for start_idx in range(0, num_samples, batch_size):
-        end_idx = min(start_idx + batch_size, num_samples)
-        batch_df = df.iloc[start_idx:end_idx + context_length - 1].copy()
-        
-        # Extract features for this batch
-        batch_data = prepare_microstructure_data(
-            df=batch_df,
-            feature_extractor=feature_extractor,
-            context_length=context_length,
-            timestamp_col=timestamp_col,
-            causal=causal  # Pass causal mode to data preparation
-        )
-        
-        # Create explicit boolean attention mask (False = valid)
-        batch_attention_mask = torch.zeros(
-            (batch_data['values'].shape[0], batch_data['values'].shape[1]), 
-            dtype=torch.bool, 
-            device=device
-        )
-        
-        # Move data to device
-        batch_values = batch_data['values'].to(device)
-        batch_time_features = batch_data['time_features'].to(device)
-        
-        # Extract features
-        batch_features = model.extract_features(
-            values=batch_values,
-            time_features=batch_time_features,
-            attention_mask=batch_attention_mask,
-            use_projection_head=True
-        )
-        all_features.append(batch_features.cpu().numpy())
+    # Extract features using GPU acceleration
+    all_features = []
+    
+    with torch.no_grad():
+        for batch_values, batch_time_features, batch_attention_mask in extract_loader:
+            # Move batch to device
+            batch_values = batch_values.to(device, non_blocking=True)
+            batch_time_features = batch_time_features.to(device, non_blocking=True)
+            batch_attention_mask = batch_attention_mask.to(device, non_blocking=True)
+            
+            # Extract features
+            batch_features = model.extract_features(
+                values=batch_values,
+                time_features=batch_time_features,
+                attention_mask=batch_attention_mask,
+                use_projection_head=True
+            )
+            
+            # Move features back to CPU and append to list
+            all_features.append(batch_features.cpu())
     
     # Combine all batches
-    features = np.vstack(all_features)
+    features = torch.cat(all_features, dim=0).numpy()
     print(f"Extracted features shape: {features.shape}")
+    
+    # For feature extraction mode 'all', keep all features
+    # For mode 'mean', keep only a subset
+    if extract_features_mode == "mean" and len(features) > len(df) / 2:
+        # Calculate indices for downsampling features (e.g., every Nth feature)
+        sample_rate = max(1, int(len(features) / len(df) * 2))
+        if sample_rate > 1:
+            features = features[::sample_rate]
+            print(f"Downsampled features to shape: {features.shape}")
     
     # Save features as dataframe
     features_df = save_features_as_dataframe(
@@ -1814,6 +2149,6 @@ def process_market_data(
         causal=causal  # Pass causal mode to feature mapping
     )
     
-    print(f"Features saved to {model_dir}/regime_features.csv")
+    print(f"Features saved to {model_dir}/regime_features.csv with {len(features_df)} rows")
     
-    return features_df, model if retrain else None 
+    return features_df, model if retrain else None

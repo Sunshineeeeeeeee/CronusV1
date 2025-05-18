@@ -1,20 +1,33 @@
 """
-Topological Data Analysis (TDA) package for volatility regime identification.
-
-This package provides tools for identifying volatility regimes using TDA techniques,
-particularly the Mapper algorithm. It includes functions for filter creation, 
-distance metrics, mapper execution, and regime analysis.
+CronusV1 TDA Module - Topological Data Analysis for Financial Time Series
 """
 
-from .filter_functions_v2 import FinancialLensFactory
-from .distance_metrics_v2 import FinancialDistanceMetrics, create_financial_distance_function, compute_distance_matrix
-from .mapper_core_v2 import FinancialMapperConfig, FinancialMapper
+from .distance_metrics_v2 import (
+    FinancialDistanceMetrics,
+    create_financial_distance_function,
+    compute_distance_matrix,
+    configure_tda_logging
+)
+
+from .mapper_core_v2 import (
+    FinancialMapperConfig,
+    FinancialMapper
+)
+
+try:
+    from .filter_functions_v2 import FinancialLensFactory
+except ImportError:
+    pass
+
+# Configure TDA logging with minimal verbosity by default
+configure_tda_logging()
 
 __all__ = [
-    'FinancialLensFactory',
     'FinancialDistanceMetrics',
+    'FinancialMapperConfig',
+    'FinancialMapper',
+    'FinancialLensFactory',
     'create_financial_distance_function',
     'compute_distance_matrix',
-    'FinancialMapperConfig',
-    'FinancialMapper'
+    'configure_tda_logging'
 ] 

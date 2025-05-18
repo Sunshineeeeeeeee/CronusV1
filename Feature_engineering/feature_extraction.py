@@ -157,7 +157,8 @@ class FeatureExtractor:
         df: pd.DataFrame,
         timestamp_col: str = 'Timestamp',
         window_size: int = 50,
-        causal: bool = True
+        causal: bool = True,
+        stride: int = 1  # Added stride parameter for downsampling
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Create tensors for transformer model input.
@@ -173,6 +174,8 @@ class FeatureExtractor:
         causal : bool
             If True, use causal context (only past information) for real-time applications
             If False, use bidirectional context (past and future) for research purposes only
+        stride : int
+            Stride for window creation (1 = every point, 2 = every other point, etc.)
             
         Returns:
         --------
@@ -228,13 +231,27 @@ class FeatureExtractor:
         features_tensor_list = []
         timedelta_tensor_list = []
         
+        # Only create windows for points that have sufficient context
+        # Use smaller min_context for causal mode to avoid losing too much data
+        min_context = max(5, window_size // 5) if causal else 0
+        
         # In causal mode, each prediction point uses only past and current information
         # preventing future information leakage for real-time applications
-        for i in range(window_size - 1, len(df)):
+        for i in range(window_size - 1, len(df), stride):
             if causal:
                 # Causal context: use window_size-1 previous points + current point
                 # This ensures no future leakage for real-time applications
                 window_df = df.iloc[i-(window_size-1):i+1]
+                if len(window_df) >= min_context:  # Ensure minimum context
+                    time_window = window_df[time_features].values
+                    features_window = window_df[market_features].values
+                    timedelta_window = window_df['time_delta'].values
+                    
+                    # Only add windows with sufficient data
+                    if len(time_window) > 0 and len(features_window) > 0:
+                        time_tensor_list.append(time_window)
+                        features_tensor_list.append(features_window)
+                        timedelta_tensor_list.append(timedelta_window)
             else:
                 # Bidirectional context: center window around prediction point
                 # WARNING: This creates future information leakage and should only be
@@ -243,18 +260,28 @@ class FeatureExtractor:
                 window_end = min(len(df), window_start + window_size)
                 window_start = max(0, window_end - window_size)  # Adjust start if end hit boundary
                 window_df = df.iloc[window_start:window_end]
+                
+                time_window = window_df[time_features].values
+                features_window = window_df[market_features].values
+                timedelta_window = window_df['time_delta'].values
+                
+                # Only add windows with sufficient data
+                if len(time_window) > 0 and len(features_window) > 0:
+                    time_tensor_list.append(time_window)
+                    features_tensor_list.append(features_window)
+                    timedelta_tensor_list.append(timedelta_window)
             
-            # Create time tensor
-            time_window = window_df[time_features].values
-            time_tensor_list.append(time_window)
-            
-            # Create features tensor
-            features_window = window_df[market_features].values
-            features_tensor_list.append(features_window)
-            
-            # Create timedelta tensor
-            timedelta_window = window_df['time_delta'].values
-            timedelta_tensor_list.append(timedelta_window)
+        # Print stats on window creation
+        print(f"Created {len(time_tensor_list)} windows from {len(df)} data points (reduction factor: {len(df)/max(1, len(time_tensor_list)):.2f}x)")
+        
+        # Convert to numpy arrays - with error handling
+        if not time_tensor_list:
+            print("WARNING: No valid windows created - using default empty tensors")
+            # Return empty tensors with the right shape
+            time_tensor = torch.zeros((0, window_size, len(time_features)), dtype=torch.float32)
+            features_tensor = torch.zeros((0, window_size, len(market_features)), dtype=torch.float32)
+            timedelta_tensor = torch.zeros((0, window_size), dtype=torch.float32)
+            return time_tensor, features_tensor, timedelta_tensor
             
         # Convert to numpy arrays
         time_array = np.array(time_tensor_list)
@@ -587,45 +614,30 @@ class FeatureExtractor:
         Calculate Kyle's lambda, which measures price impact of trades.
         Higher lambda means greater price impact per unit of volume.
         
-        This implementation uses regression of price changes on signed volume
-        to estimate the price impact coefficient.
+        This implementation uses vectorized operations instead of 
+        a for-loop for better performance.
         
-        CAUSAL FEATURE: For each point, lambda is calculated using only prior observations
-        in the rolling window, ensuring no future information leakage.
+        CAUSAL FEATURE: Uses rolling window calculations that only look backward.
         """
         result_df = df.copy()
         
         # Use signed volume based on trade direction
         signed_volume = result_df[volume_col] * result_df['trade_direction']
         
-        # Calculate rolling lambda
-        lambda_values = []
+        # For loop-less implementation - use rolling window calculations
+        # We calculate price impact coefficient (lambda) using rolling regression:
+        # price_change = lambda * signed_volume
         
-        # For each point, calculate lambda using previous window observations
-        for i in range(len(result_df)):
-            if i < window:
-                # Not enough data, use forward window
-                start, end = 0, min(window, len(result_df))
-            else:
-                start, end = i - window, i
-                
-            # Get price changes and volumes in window
-            y = result_df['price_change'].iloc[start:end].values
-            X = signed_volume.iloc[start:end].values
-            
-            # Simple regression: price_change = lambda * signed_volume
-            if np.sum(X**2) > 0:  # Check to avoid division by zero
-                lambda_est = np.sum(X * y) / np.sum(X**2)
-            else:
-                lambda_est = 0
-                
-            lambda_values.append(lambda_est)
-            
-        # Save results
-        result_df['kyle_lambda'] = lambda_values
+        # Calculate rolling products for regression
+        rolling_xy = (result_df['price_change'] * signed_volume).rolling(window=window, min_periods=1).sum()
+        rolling_x2 = (signed_volume * signed_volume).rolling(window=window, min_periods=1).sum()
+        
+        # Calculate lambda (handle division by zero)
+        lambda_values = rolling_xy / rolling_x2.replace(0, np.nan)
+        lambda_values = lambda_values.fillna(0)
         
         # Take absolute value since lambda represents magnitude of impact
-        result_df['kyle_lambda'] = np.abs(result_df['kyle_lambda'])
+        result_df['kyle_lambda'] = np.abs(lambda_values)
         
         return result_df
     
@@ -747,8 +759,8 @@ class FeatureExtractor:
         Clean features by handling any remaining NaN, infinite or extreme values.
         This ensures the data is ready for neural network training.
         
-        CAUSAL IMPLEMENTATION: All calculations only use data available up to each point 
-        to avoid look-ahead bias.
+        OPTIMIZED IMPLEMENTATION: Uses more efficient vectorized operations and
+        reduces the minimum window size requirement for percentile calculations.
         
         Parameters:
         -----------
@@ -774,6 +786,9 @@ class FeatureExtractor:
         # Identify numeric columns
         numeric_cols = [col for col in cols_to_clean if np.issubdtype(result_df[col].dtype, np.number)]
         
+        # Replace infinities with NaN first (makes subsequent operations cleaner)
+        result_df[numeric_cols] = result_df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+        
         # Check for NaN values
         nan_counts = result_df[cols_to_clean].isna().sum()
         total_nans = nan_counts.sum()
@@ -789,108 +804,51 @@ class FeatureExtractor:
                         # For core data columns, use forward fill then backward fill
                         result_df[col] = result_df[col].ffill().bfill()
                     else:
-                        # For calculated features, use median for replacement
-                        # First try forward fill (most appropriate for time series)
+                        # For calculated features, first try forward fill
                         result_df[col] = result_df[col].ffill()
                         
-                        # If any NaNs remain, use the median of non-NaN values
-                        # CAUSAL: Calculate expanding window medians
+                        # If any NaNs remain, use backward fill
                         if result_df[col].isna().any():
-                            if np.issubdtype(result_df[col].dtype, np.number):
-                                # For each NaN value, use median of prior values
-                                for i in range(len(result_df)):
-                                    if pd.isna(result_df.loc[i, col]):
-                                        # If we have enough prior data, use prior median
-                                        if i > 0:
-                                            prior_vals = result_df.loc[:i-1, col].dropna()
-                                            if len(prior_vals) > 0:
-                                                result_df.loc[i, col] = prior_vals.median()
-                                            else:
-                                                result_df.loc[i, col] = 0
-                                        else:
-                                            result_df.loc[i, col] = 0
-                            else:
-                                # For non-numeric columns, use forward fill then backward fill
-                                result_df[col] = result_df[col].ffill().bfill()
-                                # If still NaN, use a default value appropriate for the type
-                                if result_df[col].dtype == 'object':
-                                    result_df[col] = result_df[col].fillna('')
-                                else:
-                                    result_df[col] = result_df[col].fillna(0)
-        
-        # Check for infinite values (only in numeric columns)
-        if numeric_cols:
-            # Process each numeric column individually to avoid issues with mixed types
-            total_infs = 0
-            cols_with_infs = 0
-            
-            for col in numeric_cols:
-                # Check for infinities
-                inf_mask = np.isinf(result_df[col].values)
-                col_infs = np.sum(inf_mask)
-                total_infs += col_infs
-                
-                if col_infs > 0:
-                    cols_with_infs += 1
-                    # CAUSAL: Replace infinities using expanding windows
-                    for i in range(len(result_df)):
-                        if np.isinf(result_df.loc[i, col]):
-                            # Use median of prior finite values
-                            if i > 0:
-                                prior_vals = result_df.loc[:i-1, col]
-                                prior_vals = prior_vals[~np.isinf(prior_vals)]
-                                if len(prior_vals) > 0:
-                                    replacement = prior_vals.median()
-                                    result_df.loc[i, col] = replacement if not pd.isna(replacement) else 0
-                                else:
-                                    result_df.loc[i, col] = 0
-                            else:
-                                result_df.loc[i, col] = 0
-            
-            if total_infs > 0:
-                print(f"Found {total_infs} infinite values across {cols_with_infs} columns")
-                    
-        # Use expanding window approach for outlier clipping
-        # to ensure we only use data up to the current point (causal)
-        min_window_size = 100  # Minimum points needed for reliable percentiles
-        for col in numeric_cols:
-            if col not in [price_col, volume_col, 'SYMBOL']:
-                # Initialize arrays for bounds to avoid repeated pandas operations
-                upper_bounds = np.full(len(result_df), np.nan)
-                lower_bounds = np.full(len(result_df), np.nan)
-                
-                try:
-                    # Calculate expanding window percentiles
-                    for i in range(min_window_size, len(result_df)):
-                        # Use only data up to current point for bounds calculation
-                        subset = result_df.loc[:i, col].dropna()
-                        
-                        if len(subset) >= min_window_size:
-                            q01 = np.percentile(subset, 1)
-                            q99 = np.percentile(subset, 99)
+                            result_df[col] = result_df[col].bfill()
                             
-                            # Ensure the range is non-zero to avoid clipping everything to the same value
-                            if q99 > q01:
-                                # Add a buffer to avoid clipping too aggressively
-                                buffer = (q99 - q01) * 0.5
-                                lower_bounds[i] = q01 - buffer
-                                upper_bounds[i] = q99 + buffer
+                            # If still have NaNs, use column median
+                            if result_df[col].isna().any():
+                                median_val = result_df[col].median()
+                                if pd.isna(median_val):  # If median is NaN, use 0
+                                    median_val = 0
+                                result_df[col] = result_df[col].fillna(median_val)
+        
+        # Use robust percentile-based outlier clipping
+        # OPTIMIZATION: Reduced min_window_size from 100 to 20
+        min_window_size = 20  # Smaller minimum window size to preserve more data
+        
+        # Process each numeric column for outlier removal
+        for col in numeric_cols:
+            if col not in [price_col, volume_col, 'SYMBOL', timestamp_col]:
+                # Skip columns with too few values
+                if len(result_df[col].dropna()) < min_window_size:
+                    continue
                     
-                    # Apply clipping based on expanding window bounds
-                    for i in range(min_window_size, len(result_df)):
-                        if not np.isnan(lower_bounds[i]) and not np.isnan(upper_bounds[i]):
-                            current_val = result_df.loc[i, col]
-                            result_df.loc[i, col] = max(lower_bounds[i], min(upper_bounds[i], current_val))
+                try:
+                    # Calculate global percentiles for computational efficiency
+                    q01 = np.nanpercentile(result_df[col].values, 1)
+                    q99 = np.nanpercentile(result_df[col].values, 99)
+                    
+                    # Ensure the range is non-zero
+                    if q99 > q01:
+                        # Add a buffer to avoid clipping too aggressively
+                        buffer = (q99 - q01) * 0.5
+                        lower_bound = q01 - buffer
+                        upper_bound = q99 + buffer
                         
+                        # Apply clipping
+                        result_df[col] = result_df[col].clip(lower_bound, upper_bound)
                 except Exception as e:
-                    # Skip columns that can't be processed
                     print(f"Skip outlier clipping for {col}: {str(e)}")
-                    
-        # Verify no NaNs remain
-        final_nan_count = result_df[cols_to_clean].isna().sum().sum()
-        if final_nan_count > 0:
-            # Final fallback - replace any remaining NaNs with 0
-            print(f"Warning: {final_nan_count} NaN values remained after cleaning. Replacing with 0.")
+        
+        # Final NaN check and replacement
+        if result_df[cols_to_clean].isna().sum().sum() > 0:
+            # Replace any remaining NaNs with 0
             result_df = result_df.fillna(0)
             
         return result_df 

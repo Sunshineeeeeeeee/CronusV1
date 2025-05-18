@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import math
 
 # Import our models and data loaders
-from enhanced_data_loader import prepare_enhanced_trading_data
+from CronusV1.TTA.enhanced_data_loader_v1 import prepare_enhanced_trading_data
 from opportunity_model import TradingOpportunityModel, DirectionPredictor
 
 # Import configurations
